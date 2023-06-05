@@ -1,0 +1,242 @@
+---
+title: "Spectrum_methylation_analysis_TumNormal_WGBS_with_BSmooth_R"
+author: "Samuel Terkper Ahuno"
+date: "2023-05-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+#samuel ahuno
+#methylation analysis with RBSS with BSmooth r
+
+### how to run the rmd as job script
+1. run `knit` function
+2. run `bsub` line
+<!-- ## section x
+
+#To run script
+<!-- function knit() {
+module load R/R-4.1.2
+Rscript --max-ppsize=500000 -e "rmarkdown::render('$1', output_dir='$2')"
+} -->
+<!-- export -f knit
+
+#set path to Rscripts
+bsub -J "methyl_Bisulphite_spect" -R "rusage[mem=24]" -n 32 -o methyl_Bisulphite_spect.%J.out -e methyl_Bisulphite_spect.%J.err -W 5:00 "knit /juno/work/greenbaum/users/ahunos/methyl_SPECTRUM/scripts/BSmooth_WGBS_methylationAnalysisis_TumNormal.Rmd /juno/work/greenbaum/users/ahunos/methyl_SPECTRUM/scripts/" -->
+
+```{r Loadlibraries, echo=FALSE}
+library(bsseq)
+library(magrittr)
+library(data.table)
+library(BiocParallel)#used for parallel analysis
+```
+
+
+## set paths
+```{r setPaths}
+#set paths to data and analysis directories
+path_analysis_home <- "/juno/work/greenbaum/users/ahunos/methyl_SPECTRUM"
+path_sepectrum_data <- "/work/greenbaum/projects/methylation_projects/SPECTRUM"
+
+# tumPath = "/work/greenbaum/projects/methylation_projects/SPECTRUM/nf_core_methylseq_tum/OUTDIR/bismark/methylation_calls/methylation_coverage/SA123T_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz"
+# normPath =  "/work/greenbaum/projects/methylation_projects/SPECTRUM/nf_core_methylseq/OUTDIR/bismark/methylation_calls/methylation_coverage/SA123_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz"
+
+dir_2_create <- "bsmooth_methy"
+# dir.create(file.path(dir_2_create))
+# dir.create(file.path(dir_2_create, c("data")))
+wrkDir <- paste0(getwd(),"/",dir_2_create)
+```
+
+
+## section; load files
+
+```{r loadFiles}
+
+##pull all coverage files 
+files_cpG <- list.files(path_sepectrum_data, full.names = TRUE,
+                        recursive = TRUE, pattern = "*.deduplicated.bismark.cov.gz") %>%
+                            as_tibble()
+names(files_cpG) <- "File"
+
+#filter files of interest
+files_cpG_cov <- files_cpG %>% 
+                    dplyr::filter(str_detect(File, "nf_core_methylseq"))  %>% 
+                        dplyr::filter(str_detect(File, "OUTDIR")) %>% 
+                        mutate(Sample = basename(File),
+                                Sample = case_when(str_detect(Sample, "SA123_") ~ "SA123N",
+                                                 str_detect(Sample, "SA123T") ~ "SA123T"),
+                                chemistry = "methylSeq",
+                                treatment = case_when(str_detect(Sample, "SA123N") ~ "Normal",
+                                                     str_detect(Sample, "SA123T") ~ "Tumor"),
+                                Sample = gsub("_1.*","",Sample))  %>% 
+                            as.data.frame()
+#View(files_cpG_cov)
+files_cpG_cov
+```
+
+
+create master file of files, samples, groups to run bsmooth
+
+```{r metadata_EdgeR}
+sample_metadata <- files_cpG_cov %>% mutate(Group = treatment)
+sample_metadata
+```
+
+
+
+# Actual Differential methylations analysis
+### Read bismark files from disk
+
+```{r LoadBismark}
+#dmr
+#files <- sample_metadata$File
+bismark_bsseq <- read.bismark(files = sample_metadata$File,
+                    colData = DataFrame(row.names = sample_metadata$Sample, Type = sample_metadata$Group, Pair = c("Pair1", "Pair1")),
+                      rmZeroCov = FALSE,
+                      strandCollapse = FALSE,
+                      verbose = TRUE, 
+                      BACKEND = "HDF5Array",
+                      BPPARAM = MulticoreParam(workers = 16)
+                      )
+bismark_bsseq
+
+pData(bismark_bsseq)
+#try combing samples to have replicates
+bismark_bsseq_combine <- combine(bismark_bsseq, bismark_bsseq[,1])
+```
+
+
+```{r QC_1}
+sampleNames(bismark_bsseq)
+data(bismark_bsseq) #how does the dara look like
+
+#check phenoData
+pData(bismark_bsseq)
+
+#see first few granges
+head(granges(bismark_bsseq), n = 4)
+
+```
+
+
+```{r QC_2}
+#check also have the M and Cov matrices
+head(getCoverage(bismark_bsseq, type = "M"), n = 4)
+
+#check coverage for all
+head(getCoverage(bismark_bsseq), n = 4)
+
+##data
+dim(bismark_bsseq)
+round(colMeans(getCoverage(bismark_bsseq)), 1)
+# SA123T SA123N 
+#    7.6    6.6 
+#therefore average coverage per cpg of each sample is above
+## Number of CpGs in all chromosome
+length(bismark_bsseq)
+#[1] 55,261,449
+
+## Number of CpGs which are covered by at least 1 read in all 2 samples
+sum(rowSums(getCoverage(bismark_bsseq) >= 1) == 2)
+#[1] 53,947,003
+
+## Number of CpGs with 0 coverage in all samples
+sum(rowSums(getCoverage(bismark_bsseq)) == 0)
+#[1] 0
+
+#expectation of the CpGs to have at least one sample with zero coverage.
+logp <- ppois(0, lambda = 7, lower.tail = FALSE, log.p = TRUE)
+round(1 - exp(2 * logp), 3)
+```
+
+
+```{r}
+#parallization
+## Split data and run bs
+# BS1 <- bismark_bsseq[, 1]
+# saveRDS(BS1, file =paste0(wrkDir,"/SA123T.rds"))
+
+# BS2 <- bismark_bsseq[, 2]
+# saveRDS(BS2, file =paste0(wrkDir,"/SA123N.rds"))
+
+```
+
+
+### Run bsmoothing
+```{r BSmooth}
+#library(parallel)
+bismark_bsseq.fit <- BSmooth(
+    BSseq = bismark_bsseq, 
+    BPPARAM = MulticoreParam(workers = 24), 
+    verbose = TRUE)
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+
+
+
+
+
+## section; chromosomes of interset
+
+```{r Compute_Tstats}
+#filter out regions where 2 or more samples have less than 2x coverage
+# BS.cov <- getCoverage(bismark_bsseq.fit)
+# keepLoci.ex <- which(rowSums(BS.cov[, bismark_bsseq.fit$Type == "Tumor"] >= 2) >= 1 &
+#                      rowSums(BS.cov[, bismark_bsseq.fit$Type == "Normal"] >= 2) >= 1)
+# length(keepLoci.ex)
+
+# BS.cancer.ex.fit <- BS.cancer.ex.fit[keepLoci.ex,]
+
+bismark_bsseq.tstat <- BSmooth.tstat(bismark_bsseq.fit, 
+                                    group1 = c("SA123T"),
+                                    group2 = c("SA123N"), 
+                                    estimate.var = "group2",
+                                    local.correct = TRUE,
+                                    verbose = TRUE)
+bismark_bsseq.tstat
+
+# $ find /work/greenbaum/TEMP -user ahunos | xargs rm -r * | head
+# $ find /work/greenbaum/TEMP -uid 164079095 | xargs l | head
+
+```
+
+## section; plot differentailly methylated regions
+
+
+```{r plotDMRs}
+#plot DMR
+pData <- pData(bismark_bsseq.fit)
+pData$col <- rep(c("red", "blue"), each = 1)
+pData(bismark_bsseq.fit) <- pData
+
+```
+
+
+<!-- ## section x
+
+#To run script
+<!-- function knit() {
+module load R/R-4.1.2
+Rscript --max-ppsize=500000 -e "rmarkdown::render('$1', output_dir='$2')"
+} -->
+<!-- export -f knit
+
+#set path to Rscripts
+rmd_path=/juno/work/greenbaum/users/ahunos/methyl_SPECTRUM/scripts/methylation_Bisulphite_Spectrum.Rmd 
+
+bsub -J "methyl_Bisulphite_spect" -R "rusage[mem=24]" -n 32 -o methyl_Bisulphite_spect.%J.out -e methyl_Bisulphite_spect.%J.err -W 5:00 "knit /juno/work/greenbaum/users/ahunos/methyl_SPECTRUM/scripts/methylation_Bisulphite_Spectrum.Rmd /juno/work/greenbaum/users/ahunos/methyl_SPECTRUM/scripts/" -->
